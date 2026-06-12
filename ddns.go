@@ -201,7 +201,12 @@ func main() {
 	wasReachable := true
 
 	if checkReachability(config.ProbeTargets, probeTimeout) {
-		lastKnownIP = fetchAndLogIP(logger, apiURLs, httpTimeout)
+		ip := fetchAndLogIP(logger, apiURLs, httpTimeout)
+		if ip != "" {
+			lastKnownIP = ip
+			logger.Printf("Initial public IP: %s, updating DNS records...", ip)
+			lastKnownIP = updateAllRRs(logger, client, config, ip)
+		}
 	} else {
 		logger.Println("Network unreachable at startup, waiting for recovery...")
 	}
