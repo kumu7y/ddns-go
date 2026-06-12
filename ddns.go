@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -104,6 +105,8 @@ func updateDNSRecord(client *alidns.Client, domainName, publicIP, recordType, rr
 	describeRequest := alidns.CreateDescribeDomainRecordsRequest()
 	describeRequest.Scheme = "https"
 	describeRequest.DomainName = domainName
+	describeRequest.SetReadTimeout(10 * time.Second)
+	describeRequest.SetConnectTimeout(5 * time.Second)
 
 	records, err := client.DescribeDomainRecords(describeRequest)
 	if err != nil {
@@ -122,6 +125,8 @@ func updateDNSRecord(client *alidns.Client, domainName, publicIP, recordType, rr
 			updateRequest.RR = record.RR
 			updateRequest.Type = record.Type
 			updateRequest.Value = publicIP
+			updateRequest.SetReadTimeout(10 * time.Second)
+			updateRequest.SetConnectTimeout(5 * time.Second)
 
 			_, err := client.UpdateDomainRecord(updateRequest)
 			return err
@@ -134,6 +139,8 @@ func updateDNSRecord(client *alidns.Client, domainName, publicIP, recordType, rr
 	addRequest.Type = recordType
 	addRequest.RR = rr
 	addRequest.Value = publicIP
+	addRequest.SetReadTimeout(10 * time.Second)
+	addRequest.SetConnectTimeout(5 * time.Second)
 
 	_, err = client.AddDomainRecord(addRequest)
 	return err
@@ -227,6 +234,17 @@ func main() {
 	logger.Printf("DDNS started, domain: %s, rr: %s, checkInterval: %ds, ipCheckInterval: %ds, forceUpdateInterval: %dm",
 		domainName, config.RR, config.CheckInterval, config.IPCheckInterval, config.ForceUpdateInterval)
 
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Printf("PANIC recovered: %v\nstack: %s", r, debug.Stack())
+			os.Exit(1)
+		}
+	}()
+
+	failCount := 0
+	lastFailTime := time.Time{}
+	retryBackoff := 0
+
 	for {
 		select {
 		case <-probeTicker.C:
@@ -235,7 +253,18 @@ func main() {
 				logger.Println("Network recovered, checking IP immediately...")
 				ip := fetchAndLogIP(logger, apiURLs, httpTimeout)
 				if ip != "" && ip != lastKnownIP {
-					lastKnownIP = updateAllRRs(logger, client, config, ip)
+					result := updateAllRRs(logger, client, config, ip)
+					if result != "" {
+						lastKnownIP = result
+						failCount = 0
+						retryBackoff = 0
+					} else {
+						lastKnownIP = ""
+						failCount++
+						retryBackoff = calcBackoff(failCount)
+						lastFailTime = time.Now()
+						logger.Printf("DNS update failed, retry in %ds (fail #%d)", retryBackoff, failCount)
+					}
 				} else if ip != "" {
 					logger.Printf("IP unchanged: %s", ip)
 				}
@@ -243,10 +272,24 @@ func main() {
 			wasReachable = reachable
 
 		case <-ipCheckTicker.C:
+			if retryBackoff > 0 && time.Since(lastFailTime) < time.Duration(retryBackoff)*time.Second {
+				continue
+			}
 			ip := fetchAndLogIP(logger, apiURLs, httpTimeout)
 			if ip != "" && ip != lastKnownIP {
 				logger.Printf("IP changed: %s -> %s", lastKnownIP, ip)
-				lastKnownIP = updateAllRRs(logger, client, config, ip)
+				result := updateAllRRs(logger, client, config, ip)
+				if result != "" {
+					lastKnownIP = result
+					failCount = 0
+					retryBackoff = 0
+				} else {
+					lastKnownIP = ""
+					failCount++
+					retryBackoff = calcBackoff(failCount)
+					lastFailTime = time.Now()
+					logger.Printf("DNS update failed, retry in %ds (fail #%d)", retryBackoff, failCount)
+				}
 			}
 
 		case <-forceTicker.C:
@@ -255,7 +298,18 @@ func main() {
 				if ip != lastKnownIP {
 					logger.Printf("Force update: IP changed from %s to %s", lastKnownIP, ip)
 				}
-				lastKnownIP = updateAllRRs(logger, client, config, ip)
+				result := updateAllRRs(logger, client, config, ip)
+				if result != "" {
+					lastKnownIP = result
+					failCount = 0
+					retryBackoff = 0
+				} else {
+					lastKnownIP = ""
+					failCount++
+					retryBackoff = calcBackoff(failCount)
+					lastFailTime = time.Now()
+					logger.Printf("Force update failed, retry in %ds (fail #%d)", retryBackoff, failCount)
+				}
 			}
 
 		case sig := <-sigChan:
@@ -298,6 +352,21 @@ func updateAllRRs(logger *log.Logger, client *alidns.Client, config Config, publ
 		return publicIP
 	}
 	return ""
+}
+
+func calcBackoff(failCount int) int {
+	switch {
+	case failCount <= 1:
+		return 30
+	case failCount == 2:
+		return 60
+	case failCount == 3:
+		return 120
+	case failCount == 4:
+		return 300
+	default:
+		return 600
+	}
 }
 
 func loadConfig(filePath string) (Config, error) {
