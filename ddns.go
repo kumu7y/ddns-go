@@ -20,6 +20,14 @@ import (
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/alidns"
 )
 
+var defaultAPIURLs = []string{
+	"https://checkip.amazonaws.com",
+	"https://ipv4.icanhazip.com",
+	"https://ip.3322.net",
+	"https://ipinfo.io/json",
+	"https://api.ipify.org?format=json",
+}
+
 type Config struct {
 	AccessKey           string   `json:"accessKey"`
 	AccessSecret        string   `json:"accessSecret"`
@@ -39,7 +47,12 @@ type Config struct {
 var ErrNoUpdateNeeded = errors.New("DNS record unchanged, no update needed")
 
 func getPublicIPWithFallback(apiURLs []string, timeout time.Duration) (string, error) {
-	client := &http.Client{Timeout: timeout}
+	client := &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	var lastErr error
 
 	for _, url := range apiURLs {
@@ -49,7 +62,7 @@ func getPublicIPWithFallback(apiURLs []string, timeout time.Duration) (string, e
 			continue
 		}
 
-		body, err := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		resp.Body.Close()
 		if err != nil {
 			lastErr = err
@@ -68,16 +81,16 @@ func getPublicIPWithFallback(apiURLs []string, timeout time.Duration) (string, e
 		}
 
 		var result map[string]interface{}
-		if err := json.Unmarshal(body, &result); err == nil {
-			if ip, ok := result["ip"].(string); ok && ip != "" {
+		if json.Unmarshal(body, &result) == nil {
+			if ip, ok := result["ip"].(string); ok && net.ParseIP(ip) != nil {
 				return ip, nil
 			}
-			if origin, ok := result["origin"].(string); ok && origin != "" {
+			if origin, ok := result["origin"].(string); ok && net.ParseIP(origin) != nil {
 				return origin, nil
 			}
 		}
 
-		if strings.Count(text, ".") >= 3 && !strings.Contains(text, " ") && !strings.Contains(text, "<") {
+		if net.ParseIP(text) != nil {
 			return text, nil
 		}
 
@@ -146,6 +159,27 @@ func updateDNSRecord(client *alidns.Client, domainName, publicIP, recordType, rr
 	return err
 }
 
+type backoffState struct {
+	failCount    int
+	lastFailTime time.Time
+	backoff      int
+}
+
+func (b *backoffState) onSuccess() {
+	b.failCount = 0
+	b.backoff = 0
+}
+
+func (b *backoffState) onFailure() {
+	b.failCount++
+	b.backoff = calcBackoff(b.failCount)
+	b.lastFailTime = time.Now()
+}
+
+func (b *backoffState) shouldSkip() bool {
+	return b.backoff > 0 && time.Since(b.lastFailTime) < time.Duration(b.backoff)*time.Second
+}
+
 func main() {
 	configFilePath := flag.String("config", "config.json", "Path to the configuration file")
 	flag.Parse()
@@ -170,12 +204,12 @@ func main() {
 
 	logDir := filepath.Dir(logPath)
 	if logDir != "." && logDir != "" {
-		if err := os.MkdirAll(logDir, 0755); err != nil {
+		if err := os.MkdirAll(logDir, 0700); err != nil {
 			log.Fatal("Failed to create log directory:", err)
 		}
 	}
 
-	logFile, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	logFile, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
 		log.Fatal("Failed to open log file:", err)
 	}
@@ -184,6 +218,13 @@ func main() {
 	multiWriter := io.MultiWriter(os.Stdout, logFile)
 	logger := log.New(multiWriter, "DDns: ", log.LstdFlags|log.Lmicroseconds)
 
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Printf("PANIC recovered: %v\nstack: %s", r, debug.Stack())
+			os.Exit(1)
+		}
+	}()
+
 	client, err := alidns.NewClientWithAccessKey("cn-hangzhou", config.AccessKey, config.AccessSecret)
 	if err != nil {
 		logger.Fatalf("Failed to create Aliyun DNS client: %v", err)
@@ -191,16 +232,9 @@ func main() {
 
 	apiURLs := config.APIURLs
 	if len(apiURLs) == 0 {
-		apiURLs = []string{
-			"https://checkip.amazonaws.com",
-			"https://ipv4.icanhazip.com",
-			"https://ip.3322.net",
-			"https://ipinfo.io/json",
-			"https://api.ipify.org?format=json",
-		}
+		apiURLs = defaultAPIURLs
 	}
 
-	domainName := config.DomainName
 	httpTimeout := time.Duration(config.Timeout) * time.Second
 	probeTimeout := 3 * time.Second
 
@@ -210,7 +244,6 @@ func main() {
 	if checkReachability(config.ProbeTargets, probeTimeout) {
 		ip := fetchAndLogIP(logger, apiURLs, httpTimeout)
 		if ip != "" {
-			lastKnownIP = ip
 			logger.Printf("Initial public IP: %s, updating DNS records...", ip)
 			lastKnownIP = updateAllRRs(logger, client, config, ip)
 		}
@@ -221,29 +254,19 @@ func main() {
 	probeTicker := time.NewTicker(time.Duration(config.CheckInterval) * time.Second)
 	ipCheckTicker := time.NewTicker(time.Duration(config.IPCheckInterval) * time.Second)
 	forceTicker := time.NewTicker(time.Duration(config.ForceUpdateInterval) * time.Minute)
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
 	defer func() {
 		probeTicker.Stop()
 		ipCheckTicker.Stop()
 		forceTicker.Stop()
 	}()
 
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
 	logger.Printf("DDNS started, domain: %s, rr: %s, checkInterval: %ds, ipCheckInterval: %ds, forceUpdateInterval: %dm",
-		domainName, config.RR, config.CheckInterval, config.IPCheckInterval, config.ForceUpdateInterval)
+		config.DomainName, config.RR, config.CheckInterval, config.IPCheckInterval, config.ForceUpdateInterval)
 
-	defer func() {
-		if r := recover(); r != nil {
-			logger.Printf("PANIC recovered: %v\nstack: %s", r, debug.Stack())
-			os.Exit(1)
-		}
-	}()
-
-	failCount := 0
-	lastFailTime := time.Time{}
-	retryBackoff := 0
+	bo := &backoffState{}
 
 	for {
 		select {
@@ -253,18 +276,7 @@ func main() {
 				logger.Println("Network recovered, checking IP immediately...")
 				ip := fetchAndLogIP(logger, apiURLs, httpTimeout)
 				if ip != "" && ip != lastKnownIP {
-					result := updateAllRRs(logger, client, config, ip)
-					if result != "" {
-						lastKnownIP = result
-						failCount = 0
-						retryBackoff = 0
-					} else {
-						lastKnownIP = ""
-						failCount++
-						retryBackoff = calcBackoff(failCount)
-						lastFailTime = time.Now()
-						logger.Printf("DNS update failed, retry in %ds (fail #%d)", retryBackoff, failCount)
-					}
+					lastKnownIP = applyUpdate(logger, bo, client, config, ip)
 				} else if ip != "" {
 					logger.Printf("IP unchanged: %s", ip)
 				}
@@ -272,24 +284,13 @@ func main() {
 			wasReachable = reachable
 
 		case <-ipCheckTicker.C:
-			if retryBackoff > 0 && time.Since(lastFailTime) < time.Duration(retryBackoff)*time.Second {
+			if bo.shouldSkip() {
 				continue
 			}
 			ip := fetchAndLogIP(logger, apiURLs, httpTimeout)
 			if ip != "" && ip != lastKnownIP {
 				logger.Printf("IP changed: %s -> %s", lastKnownIP, ip)
-				result := updateAllRRs(logger, client, config, ip)
-				if result != "" {
-					lastKnownIP = result
-					failCount = 0
-					retryBackoff = 0
-				} else {
-					lastKnownIP = ""
-					failCount++
-					retryBackoff = calcBackoff(failCount)
-					lastFailTime = time.Now()
-					logger.Printf("DNS update failed, retry in %ds (fail #%d)", retryBackoff, failCount)
-				}
+				lastKnownIP = applyUpdate(logger, bo, client, config, ip)
 			}
 
 		case <-forceTicker.C:
@@ -298,18 +299,7 @@ func main() {
 				if ip != lastKnownIP {
 					logger.Printf("Force update: IP changed from %s to %s", lastKnownIP, ip)
 				}
-				result := updateAllRRs(logger, client, config, ip)
-				if result != "" {
-					lastKnownIP = result
-					failCount = 0
-					retryBackoff = 0
-				} else {
-					lastKnownIP = ""
-					failCount++
-					retryBackoff = calcBackoff(failCount)
-					lastFailTime = time.Now()
-					logger.Printf("Force update failed, retry in %ds (fail #%d)", retryBackoff, failCount)
-				}
+				lastKnownIP = applyUpdate(logger, bo, client, config, ip)
 			}
 
 		case sig := <-sigChan:
@@ -317,6 +307,17 @@ func main() {
 			return
 		}
 	}
+}
+
+func applyUpdate(logger *log.Logger, bo *backoffState, client *alidns.Client, config Config, ip string) string {
+	result := updateAllRRs(logger, client, config, ip)
+	if result != "" {
+		bo.onSuccess()
+		return result
+	}
+	bo.onFailure()
+	logger.Printf("DNS update failed, retry in %ds (fail #%d)", bo.backoff, bo.failCount)
+	return ""
 }
 
 func fetchAndLogIP(logger *log.Logger, apiURLs []string, timeout time.Duration) string {
@@ -422,13 +423,7 @@ func saveDefaultConfig(filePath string) error {
 		AccessSecret:        "",
 		DomainName:          "your_domain_name",
 		LogPath:             "DDns.log",
-		APIURLs: []string{
-			"https://checkip.amazonaws.com",
-			"https://ipv4.icanhazip.com",
-			"https://ip.3322.net",
-			"https://ipinfo.io/json",
-			"https://api.ipify.org?format=json",
-		},
+		APIURLs:             defaultAPIURLs,
 		RecordType:          "A",
 		RR:                  "*",
 		CheckInterval:       5,
