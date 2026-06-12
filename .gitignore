@@ -1,3 +1,5 @@
 /build/
 *.log
 config.json
+DDNS
+DDNS-linux-arm64

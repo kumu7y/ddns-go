@@ -1,0 +1,23 @@
+{
+    "accessKey": "",
+    "accessSecret": "",
+    "domainName": "kumu7y.icu",
+    "logPath": "/var/log/DDNS/DDNS.log",
+    "apiURLs": [
+        "https://checkip.amazonaws.com",
+        "https://ipv4.icanhazip.com",
+        "https://ip.3322.net",
+        "https://ipinfo.io/json",
+        "https://api.ipify.org?format=json"
+    ],
+    "recordType": "A",
+    "rr": "@",
+    "checkInterval": 5,
+    "ipCheckInterval": 30,
+    "forceUpdateInterval": 5,
+    "probeTargets": [
+        "1.1.1.1:443",
+        "dns.alidns.com:443"
+    ],
+    "timeout": 10
+}
