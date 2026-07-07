@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/alidns"
+	"github.com/cloudflare/cloudflare-go"
 )
 
 var defaultAPIURLs = []string{
@@ -29,6 +31,9 @@ var defaultAPIURLs = []string{
 }
 
 type Config struct {
+	DnsProvider         string   `json:"dnsProvider"`
+	CloudflareToken     string   `json:"cloudflareToken"`
+	ZoneID              string   `json:"zoneID"`
 	AccessKey           string   `json:"accessKey"`
 	AccessSecret        string   `json:"accessSecret"`
 	DomainName          string   `json:"domainName"`
@@ -225,9 +230,13 @@ func main() {
 		}
 	}()
 
-	client, err := alidns.NewClientWithAccessKey("cn-hangzhou", config.AccessKey, config.AccessSecret)
-	if err != nil {
-		logger.Fatalf("Failed to create Aliyun DNS client: %v", err)
+	var client *alidns.Client
+	if config.DnsProvider != "cloudflare" {
+		var err error
+		client, err = alidns.NewClientWithAccessKey("cn-hangzhou", config.AccessKey, config.AccessSecret)
+		if err != nil {
+			logger.Fatalf("Failed to create Aliyun DNS client: %v", err)
+		}
 	}
 
 	apiURLs := config.APIURLs
@@ -332,17 +341,33 @@ func fetchAndLogIP(logger *log.Logger, apiURLs []string, timeout time.Duration) 
 func updateAllRRs(logger *log.Logger, client *alidns.Client, config Config, publicIP string) string {
 	rrs := strings.Split(config.RR, ",")
 	success := true
+
+	var cfAPI *cloudflare.API
+	if config.DnsProvider == "cloudflare" {
+		var err error
+		cfAPI, err = cloudflare.NewWithAPIToken(config.CloudflareToken)
+		if err != nil {
+			logger.Printf("Failed to create Cloudflare client: %v", err)
+			return ""
+		}
+	}
+
 	for _, r := range rrs {
 		currentRR := strings.TrimSpace(r)
 		if currentRR == "" {
 			continue
 		}
-		err := updateDNSRecord(client, config.DomainName, publicIP, config.RecordType, currentRR)
+		var err error
+		if config.DnsProvider == "cloudflare" {
+			err = updateDNSRecordCloudflare(cfAPI, config, publicIP, currentRR)
+		} else {
+			err = updateDNSRecord(client, config.DomainName, publicIP, config.RecordType, currentRR)
+		}
 		if err != nil {
 			if err == ErrNoUpdateNeeded {
 				logger.Printf("RR '%s' already points to %s, skipped", currentRR, publicIP)
 			} else {
-				logger.Printf("Failed to update RR '%s': %v", currentRR, err)
+				logger.Printf("RR '%s' update failed: %v", currentRR, err)
 				success = false
 			}
 		} else {
@@ -353,6 +378,49 @@ func updateAllRRs(logger *log.Logger, client *alidns.Client, config Config, publ
 		return publicIP
 	}
 	return ""
+}
+
+func updateDNSRecordCloudflare(cfAPI *cloudflare.API, config Config, publicIP, rr string) error {
+	ctx := context.Background()
+
+	recordName := rr
+	if rr == "@" {
+		recordName = config.DomainName
+	} else {
+		recordName = rr + "." + config.DomainName
+	}
+
+	records, _, err := cfAPI.ListDNSRecords(ctx, cloudflare.ZoneIdentifier(config.ZoneID), cloudflare.ListDNSRecordsParams{
+		Type: config.RecordType,
+		Name: recordName,
+	})
+	if err != nil {
+		return err
+	}
+
+	for _, rec := range records {
+		if rec.Type == config.RecordType && rec.Name == recordName {
+			if rec.Content == publicIP {
+				return ErrNoUpdateNeeded
+			}
+			_, err := cfAPI.UpdateDNSRecord(ctx, cloudflare.ZoneIdentifier(config.ZoneID), cloudflare.UpdateDNSRecordParams{
+				ID:      rec.ID,
+				Type:    config.RecordType,
+				Name:    recordName,
+				Content: publicIP,
+				Proxied: cloudflare.BoolPtr(false),
+			})
+			return err
+		}
+	}
+
+	_, err = cfAPI.CreateDNSRecord(ctx, cloudflare.ZoneIdentifier(config.ZoneID), cloudflare.CreateDNSRecordParams{
+		Type:    config.RecordType,
+		Name:    recordName,
+		Content: publicIP,
+		Proxied: cloudflare.BoolPtr(false),
+	})
+	return err
 }
 
 func calcBackoff(failCount int) int {

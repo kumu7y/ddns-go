@@ -1,4 +1,7 @@
 {
+    "dnsProvider": "aliyun",
+    "cloudflareToken": "",
+    "zoneID": "",
     "accessKey": "",
     "accessSecret": "",
     "domainName": "kumu7y.icu",
