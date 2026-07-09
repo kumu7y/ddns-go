@@ -22,5 +22,6 @@
         "1.1.1.1:443",
         "dns.alidns.com:443"
     ],
-    "timeout": 10
+    "timeout": 10,
+    "ttl": 1
 }

@@ -47,6 +47,7 @@ type Config struct {
 	ForceUpdateInterval int      `json:"forceUpdateInterval"`
 	ProbeTargets        []string `json:"probeTargets"`
 	Timeout             int      `json:"timeout"`
+	TTL                 int      `json:"ttl"`
 }
 
 var ErrNoUpdateNeeded = errors.New("DNS record unchanged, no update needed")
@@ -408,7 +409,7 @@ func updateDNSRecordCloudflare(cfAPI *cloudflare.API, config Config, publicIP, r
 				Type:    config.RecordType,
 				Name:    recordName,
 				Content: publicIP,
-				TTL:     1,
+				TTL:     config.TTL,
 				Proxied: cloudflare.BoolPtr(false),
 			})
 			return err
@@ -419,7 +420,7 @@ func updateDNSRecordCloudflare(cfAPI *cloudflare.API, config Config, publicIP, r
 		Type:    config.RecordType,
 		Name:    recordName,
 		Content: publicIP,
-		TTL:     1,
+		TTL:     config.TTL,
 		Proxied: cloudflare.BoolPtr(false),
 	})
 	return err
@@ -476,6 +477,9 @@ func applyConfigDefaults(config *Config) {
 	}
 	if len(config.ProbeTargets) == 0 {
 		config.ProbeTargets = []string{"1.1.1.1:443", "dns.alidns.com:443"}
+	}
+	if config.TTL <= 0 {
+		config.TTL = 1
 	}
 }
 
