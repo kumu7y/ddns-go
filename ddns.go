@@ -447,7 +447,8 @@ func sendNotify(config Config, publicIP string) error {
 	subject := fmt.Sprintf("[DDNS] %s -> %s", config.DomainName, publicIP)
 	body := fmt.Sprintf("Domain: %s\r\nIP: %s\r\nTime: %s\r\nRR: %s",
 		config.DomainName, publicIP, time.Now().Format("2006-01-02 15:04:05"), config.RR)
-	msg := []byte("To: " + config.NotifyEmail + "\r\n" +
+	msg := []byte("From: " + config.SMTPUser + "\r\n" +
+		"To: " + config.NotifyEmail + "\r\n" +
 		"Subject: " + subject + "\r\n" +
 		"Content-Type: text/plain; charset=UTF-8\r\n" +
 		"\r\n" + body)
