@@ -408,6 +408,7 @@ func updateDNSRecordCloudflare(cfAPI *cloudflare.API, config Config, publicIP, r
 				Type:    config.RecordType,
 				Name:    recordName,
 				Content: publicIP,
+				TTL:     1,
 				Proxied: cloudflare.BoolPtr(false),
 			})
 			return err
@@ -418,6 +419,7 @@ func updateDNSRecordCloudflare(cfAPI *cloudflare.API, config Config, publicIP, r
 		Type:    config.RecordType,
 		Name:    recordName,
 		Content: publicIP,
+		TTL:     1,
 		Proxied: cloudflare.BoolPtr(false),
 	})
 	return err
