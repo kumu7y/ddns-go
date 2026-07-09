@@ -1,6 +1,6 @@
-# ailiyunDDns
+# ddns-go
 
-基于 Go 的阿里云 DDNS 客户端，自动将公网 IP 同步到阿里云 DNS 解析记录。
+基于 Go 的多平台 DDNS 客户端，支持阿里云 DNS 和 Cloudflare DNS，自动将公网 IP 同步到域名解析记录。
 
 ## 功能特性
 

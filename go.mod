@@ -1,4 +1,4 @@
-module DDns_go
+module github.com/kumu7y/ddns-go
 
 go 1.21.5
 
