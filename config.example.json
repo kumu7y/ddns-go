@@ -23,5 +23,10 @@
         "dns.alidns.com:443"
     ],
     "timeout": 10,
-    "ttl": 1
+    "ttl": 1,
+    "smtpHost": "",
+    "smtpPort": 587,
+    "smtpUser": "",
+    "smtpPassword": "",
+    "notifyEmail": ""
 }

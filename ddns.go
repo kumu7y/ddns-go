@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/smtp"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -48,6 +49,11 @@ type Config struct {
 	ProbeTargets        []string `json:"probeTargets"`
 	Timeout             int      `json:"timeout"`
 	TTL                 int      `json:"ttl"`
+	SMTPHost            string   `json:"smtpHost"`
+	SMTPPort            int      `json:"smtpPort"`
+	SMTPUser            string   `json:"smtpUser"`
+	SMTPPassword        string   `json:"smtpPassword"`
+	NotifyEmail         string   `json:"notifyEmail"`
 }
 
 var ErrNoUpdateNeeded = errors.New("DNS record unchanged, no update needed")
@@ -342,6 +348,7 @@ func fetchAndLogIP(logger *log.Logger, apiURLs []string, timeout time.Duration) 
 func updateAllRRs(logger *log.Logger, client *alidns.Client, config Config, publicIP string) string {
 	rrs := strings.Split(config.RR, ",")
 	success := true
+	updated := false
 
 	var cfAPI *cloudflare.API
 	if config.DnsProvider == "cloudflare" {
@@ -373,9 +380,15 @@ func updateAllRRs(logger *log.Logger, client *alidns.Client, config Config, publ
 			}
 		} else {
 			logger.Printf("RR '%s' updated successfully to %s", currentRR, publicIP)
+			updated = true
 		}
 	}
 	if success {
+		if updated {
+			if err := sendNotify(config, publicIP); err != nil {
+				logger.Printf("Failed to send notification: %v", err)
+			}
+		}
 		return publicIP
 	}
 	return ""
@@ -424,6 +437,22 @@ func updateDNSRecordCloudflare(cfAPI *cloudflare.API, config Config, publicIP, r
 		Proxied: cloudflare.BoolPtr(false),
 	})
 	return err
+}
+
+func sendNotify(config Config, publicIP string) error {
+	if config.SMTPHost == "" || config.NotifyEmail == "" {
+		return nil
+	}
+	auth := smtp.PlainAuth("", config.SMTPUser, config.SMTPPassword, config.SMTPHost)
+	subject := fmt.Sprintf("[DDNS] %s -> %s", config.DomainName, publicIP)
+	body := fmt.Sprintf("Domain: %s\r\nIP: %s\r\nTime: %s\r\nRR: %s",
+		config.DomainName, publicIP, time.Now().Format("2006-01-02 15:04:05"), config.RR)
+	msg := []byte("To: " + config.NotifyEmail + "\r\n" +
+		"Subject: " + subject + "\r\n" +
+		"Content-Type: text/plain; charset=UTF-8\r\n" +
+		"\r\n" + body)
+	addr := fmt.Sprintf("%s:%d", config.SMTPHost, config.SMTPPort)
+	return smtp.SendMail(addr, auth, config.SMTPUser, []string{config.NotifyEmail}, msg)
 }
 
 func calcBackoff(failCount int) int {
